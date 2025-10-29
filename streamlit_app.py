@@ -13,9 +13,9 @@ INVOICE_SCHEMA = types.Schema(
     type=types.Type.OBJECT,
     properties={
         "Invoice_Date": types.Schema(type=types.Type.STRING, description="The date the invoice was issued, in YYYY-MM-DD format (e.g., 2025-08-31)."),
-        "Total_Amount_Excl_VAT": types.Schema(type=types.Type.STRING, description="The total amount of the invoice *excluding* VAT/Tax. Only the numerical value, no currency symbols or commas."),
-        "Total_Amount_Incl_VAT": types.Schema(type=types.Type.STRING, description="The final total amount of the invoice *including* all VAT/Tax. Only the numerical value, no currency symbols or commas."),
-        "VAT_Amount": types.Schema(type=types.Type.STRING, description="The total VAT/Tax amount, if explicitly listed. Only the numerical value, no currency symbols or commas."),
+        "Total_Amount_Excl_VAT": types.Schema(type=types.Type.STRING, description="The total amount of the invoice *excluding* VAT/Tax. Only the numerical value, no currency symbols or commas, using a DOT (.) for the decimal separator."),
+        "Total_Amount_Incl_VAT": types.Schema(type=types.Type.STRING, description="The final total amount of the invoice *including* all VAT/Tax. Only the numerical value, no currency symbols or commas, using a DOT (.) for the decimal separator."),
+        "VAT_Amount": types.Schema(type=types.Type.STRING, description="The total VAT/Tax amount, if explicitly listed. Only the numerical value, no currency symbols or commas, using a DOT (.) for the decimal separator."),
     },
     # Ensure these key fields are always extracted
     required=["Invoice_Date", "Total_Amount_Excl_VAT", "Total_Amount_Incl_VAT"]
@@ -39,14 +39,12 @@ def get_mime_type(file_name, file_type):
         return 'image/png'
     return 'application/octet-stream' # Default for safety
 
-
 # --- 2. EXTRACTION FUNCTION ---
 
 def extract_invoice_data(file_bytes, file_name):
     """Calls the Gemini API to extract structured data from a file."""
     try:
         # Initialize the client (API key is pulled from Streamlit secrets automatically)
-        # We need to explicitly set the API key from secrets for the client
         api_key = st.secrets.get("GEMINI_API_KEY")
         if not api_key:
             raise ValueError("GEMINI_API_KEY is not configured in Streamlit secrets.")
@@ -79,7 +77,7 @@ def extract_invoice_data(file_bytes, file_name):
         return data
 
     except APIError as e:
-        st.error(f"Gemini API Error for **{file_name}**: The API reported an issue. This can often be due to an unsupported file, a content issue, or an invalid API key. Details: `{e}`")
+        st.error(f"Gemini API Error for **{file_name}**: The API reported an issue. Details: `{e}`")
         return None
     except ValueError as e:
         st.error(f"Configuration Error: {e}")
@@ -88,7 +86,29 @@ def extract_invoice_data(file_bytes, file_name):
         st.error(f"An unexpected error occurred for **{file_name}**: {e}")
         return None
 
-# --- 3. STREAMLIT APP LAYOUT ---
+# --- 3. DATA FORMATTING FUNCTION ---
+
+def format_amount_to_comma_decimal(value):
+    """Converts a string number (e.g., '1234.56') to a comma-decimal string (e.g., '1234,56')."""
+    if pd.isna(value) or str(value) in ['NOT_FOUND', 'nan', '']:
+        return 'NOT_FOUND'
+
+    # Ensure the value is a string and use dot as decimal for conversion
+    value_str = str(value).replace(',', '.') 
+    
+    try:
+        # 1. Convert the string to a float.
+        number = float(value_str)
+        
+        # 2. Format the float to a string with two decimal places (e.g., '1234.56')
+        # 3. Replace the decimal dot with a comma (e.g., '1234,56')
+        formatted_str = f"{number:.2f}".replace(".", ",")
+        return formatted_str
+        
+    except ValueError:
+        return value_str # Return the original string if conversion fails
+
+# --- 4. STREAMLIT APP LAYOUT & LOGIC ---
 
 st.set_page_config(
     page_title="AI Invoice Extractor to Excel",
@@ -110,8 +130,6 @@ process_button = st.button("Extract Data & Generate Excel")
 if 'results' not in st.session_state:
     st.session_state.results = []
 
-# --- 4. MAIN LOGIC ---
-
 if process_button and uploaded_files:
     # Clear previous results
     st.session_state.results = []
@@ -123,28 +141,30 @@ if process_button and uploaded_files:
         for i, uploaded_file in enumerate(uploaded_files):
             st.info(f"Processing file {i+1} of {total_files}: **{uploaded_file.name}**")
             
-            # The file is a Streamlit UploadedFile object. Read its bytes.
             file_bytes = uploaded_file.getvalue()
-            
-            # Perform the extraction
             extracted_series = extract_invoice_data(file_bytes, uploaded_file.name)
             
             if extracted_series is not None:
                 st.session_state.results.append(extracted_series)
             
-            # Update progress
             progress_bar.progress((i + 1) / total_files)
 
     if st.session_state.results:
         # Combine all results into a single DataFrame
         df = pd.DataFrame(st.session_state.results)
         
+        # --- NEW FORMATTING SECTION ---
+        amount_cols = ['Total_Amount_Excl_VAT', 'Total_Amount_Incl_VAT', 'VAT_Amount']
+        for col in amount_cols:
+            df[col] = df[col].apply(format_amount_to_comma_decimal)
+        # --- END NEW FORMATTING SECTION ---
+        
         # Reorder columns for a better view
         df = df[['File_Name', 'Invoice_Date', 'Total_Amount_Incl_VAT', 'Total_Amount_Excl_VAT', 'VAT_Amount']]
         
         st.success("✅ Extraction Complete! See the results below.")
         
-        # Display the DataFrame
+        # Display the DataFrame (now with comma decimals)
         st.dataframe(df)
 
         # --- Create Excel for Download ---
@@ -152,6 +172,7 @@ if process_button and uploaded_files:
         def convert_df_to_excel(df):
             output = BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                # The data is saved to Excel with comma decimals as requested
                 df.to_excel(writer, index=False, sheet_name='Invoice_Data')
             return output.getvalue()
         
