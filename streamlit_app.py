@@ -4,7 +4,8 @@ from io import BytesIO
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
-import os
+from openpyxl import Workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
 
 # --- 1. CONFIGURATION ---
 
@@ -17,7 +18,6 @@ INVOICE_SCHEMA = types.Schema(
         "Total_Amount_Incl_VAT": types.Schema(type=types.Type.STRING, description="The final total amount of the invoice *including* all VAT/Tax. Only the numerical value, no currency symbols or commas, using a DOT (.) for the decimal separator."),
         "VAT_Amount": types.Schema(type=types.Type.STRING, description="The total VAT/Tax amount, if explicitly listed. Only the numerical value, no currency symbols or commas, using a DOT (.) for the decimal separator."),
     },
-    # Ensure these key fields are always extracted
     required=["Invoice_Date", "Total_Amount_Excl_VAT", "Total_Amount_Incl_VAT"]
 )
 
@@ -37,7 +37,7 @@ def get_mime_type(file_name, file_type):
         return 'image/jpeg'
     elif file_type == 'png':
         return 'image/png'
-    return 'application/octet-stream' # Default for safety
+    return 'application/octet-stream'
 
 # --- 2. EXTRACTION FUNCTION ---
 
@@ -49,14 +49,12 @@ def extract_invoice_data(file_bytes, file_name):
         if not api_key:
             raise ValueError("GEMINI_API_KEY is not configured in Streamlit secrets.")
         
-        # Initialize client with the fetched key
         client = genai.Client(api_key=api_key)
 
         # Determine correct MIME type
         file_type = file_name.split('.')[-1].lower()
         mime_type = get_mime_type(file_name, file_type)
         
-        # Create a content part from the uploaded file bytes
         invoice_part = types.Part.from_bytes(
             data=file_bytes,
             mime_type=mime_type
@@ -71,7 +69,6 @@ def extract_invoice_data(file_bytes, file_name):
             ),
         )
 
-        # The response text will be a JSON string conforming to the schema
         data = pd.read_json(response.text, typ='series')
         data['File_Name'] = file_name
         return data
@@ -86,29 +83,61 @@ def extract_invoice_data(file_bytes, file_name):
         st.error(f"An unexpected error occurred for **{file_name}**: {e}")
         return None
 
-# --- 3. DATA FORMATTING FUNCTION ---
+# --- 3. DATA CLEANUP & CONVERSION FUNCTION (NEW) ---
 
-def format_amount_to_comma_decimal(value):
-    """Converts a string number (e.g., '1234.56') to a comma-decimal string (e.g., '1234,56')."""
-    if pd.isna(value) or str(value) in ['NOT_FOUND', 'nan', '']:
-        return 'NOT_FOUND'
-
-    # Ensure the value is a string and use dot as decimal for conversion
-    value_str = str(value).replace(',', '.') 
+def format_amount_to_number(value):
+    """Converts a string amount (potentially with commas as thousands separators) to a clean float."""
+    if pd.isna(value) or str(value).upper() in ['NOT_FOUND', 'NAN', '']:
+        return None  # Use None for missing data, which is better than text
+    
+    # 1. Clean the string: remove commas (thousands separator), and ensure dot is the decimal.
+    # We are assuming the API returns standard US/International format (dot decimal, comma thousands).
+    value_str = str(value).replace(',', '').strip() 
     
     try:
-        # 1. Convert the string to a float.
-        number = float(value_str)
-        
-        # 2. Format the float to a string with two decimal places (e.g., '1234.56')
-        # 3. Replace the decimal dot with a comma (e.g., '1234,56')
-        formatted_str = f"{number:.2f}".replace(".", ",")
-        return formatted_str
-        
+        return float(value_str)
     except ValueError:
-        return value_str # Return the original string if conversion fails
+        return None # Return None if conversion to a number fails
 
-# --- 4. STREAMLIT APP LAYOUT & LOGIC ---
+# --- 4. EXCEL GENERATION FUNCTION (MODIFIED) ---
+
+@st.cache_data
+def convert_df_to_excel(df):
+    """Generates the Excel file, applying the comma decimal format."""
+    
+    # We need to use openpyxl directly to apply a specific number format
+    output = BytesIO()
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Invoice_Data"
+    
+    # 1. Write the DataFrame headers and rows to the worksheet
+    for r_idx, row in enumerate(dataframe_to_rows(df, header=True, index=False)):
+        ws.append(row)
+        
+    # 2. Define the columns to format (based on the reordered DF)
+    # Total_Amount_Incl_VAT is in column C (index 3), Excl_VAT in D (index 4), VAT_Amount in E (index 5)
+    formatted_cols = [3, 4, 5]
+    
+    # 3. Define the custom number format (tells Excel to use comma as decimal)
+    # Example format: 1.234,56 (0 is for whole number, 00 is for decimal places)
+    comma_decimal_format = '#,##0.00' 
+
+    # 4. Apply the format to all data cells in the target columns (starting from row 2, skipping header)
+    for col_idx in formatted_cols:
+        # Iterate over rows starting from the first data row (row index 2)
+        for row in ws.iter_rows(min_row=2, min_col=col_idx, max_col=col_idx):
+            for cell in row:
+                if cell.value is not None:
+                    # Set the number format
+                    cell.number_format = comma_decimal_format
+                    
+    # Save the workbook to the BytesIO object
+    wb.save(output)
+    return output.getvalue()
+
+
+# --- 5. STREAMLIT APP LAYOUT & LOGIC ---
 
 st.set_page_config(
     page_title="AI Invoice Extractor to Excel",
@@ -126,12 +155,10 @@ uploaded_files = st.file_uploader(
 
 process_button = st.button("Extract Data & Generate Excel")
 
-# Initialize session state for results if not present
 if 'results' not in st.session_state:
     st.session_state.results = []
 
 if process_button and uploaded_files:
-    # Clear previous results
     st.session_state.results = []
     total_files = len(uploaded_files)
 
@@ -153,29 +180,23 @@ if process_button and uploaded_files:
         # Combine all results into a single DataFrame
         df = pd.DataFrame(st.session_state.results)
         
-        # --- NEW FORMATTING SECTION ---
+        # --- NEW CONVERSION SECTION ---
         amount_cols = ['Total_Amount_Excl_VAT', 'Total_Amount_Incl_VAT', 'VAT_Amount']
         for col in amount_cols:
-            df[col] = df[col].apply(format_amount_to_comma_decimal)
-        # --- END NEW FORMATTING SECTION ---
+            # Convert string extraction to actual float numbers
+            df[col] = df[col].apply(format_amount_to_number)
+        
+        # --- END NEW CONVERSION SECTION ---
         
         # Reorder columns for a better view
         df = df[['File_Name', 'Invoice_Date', 'Total_Amount_Incl_VAT', 'Total_Amount_Excl_VAT', 'VAT_Amount']]
         
         st.success("✅ Extraction Complete! See the results below.")
         
-        # Display the DataFrame (now with comma decimals)
-        st.dataframe(df)
+        # Display the DataFrame (Note: Streamlit's display will still use dot decimals)
+        st.dataframe(df.fillna('NOT_FOUND'))
 
-        # --- Create Excel for Download ---
-        @st.cache_data
-        def convert_df_to_excel(df):
-            output = BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                # The data is saved to Excel with comma decimals as requested
-                df.to_excel(writer, index=False, sheet_name='Invoice_Data')
-            return output.getvalue()
-        
+        # Generate the Excel file with the custom number formatting
         excel_data = convert_df_to_excel(df)
 
         st.download_button(
